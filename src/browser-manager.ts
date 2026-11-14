@@ -8,6 +8,7 @@ import { chromium, type Browser, type BrowserContext, type Page } from "playwrig
 import { FlowError } from "./errors.js";
 import { validateAccountId } from "./paths.js";
 import { FlowStore } from "./store.js";
+import { isFlowPageUrl } from "./navigation.js";
 import { FLOW_URL } from "./types.js";
 import type { TransferredCookie } from "./types.js";
 
@@ -95,8 +96,30 @@ async function waitForCdp(endpoint: string, process: ChildProcess, timeoutMs = 2
 }
 
 async function closeManagedBrowser(browser: Browser, process: ChildProcess): Promise<void> {
+  // browser.close() over CDP only disconnects, and killing the process at once loses cookies Chromium has not
+  // flushed to disk yet (a fresh login would be gone on the next launch). Ask Chromium to quit, then wait.
+  try {
+    const session = await browser.newBrowserCDPSession();
+    await session.send("Browser.close");
+  } catch {
+    // Already closed or not reachable; the fallbacks below still apply.
+  }
+  if (process.exitCode === null) {
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, 10_000);
+      process.once("exit", () => { clearTimeout(timer); resolve(); });
+    });
+  }
   await browser.close().catch(() => undefined);
   if (process.exitCode === null && !process.killed) process.kill();
+}
+
+const SESSION_COOKIE_LIFETIME_SECONDS = 14 * 24 * 60 * 60;
+
+// Chromium drops session cookies (no expiry) when the managed browser restarts, which signs Flow out
+// after the login window closes. Give them a bounded lifetime so the saved profile keeps the login.
+export function persistentExpiry(expirationDate: number | undefined, nowSeconds = Date.now() / 1000): number {
+  return expirationDate && expirationDate > 0 ? expirationDate : Math.floor(nowSeconds + SESSION_COOKIE_LIFETIME_SECONDS);
 }
 
 export class BrowserManager {
@@ -154,7 +177,7 @@ export class BrowserManager {
       const browser = await chromium.connectOverCDP(session.endpoint);
       const context = browser.contexts()[0];
       if (!context) return null;
-      const page = context.pages().find((candidate) => candidate.url().startsWith("https://labs.google/"))
+      const page = context.pages().find((candidate) => isFlowPageUrl(candidate.url()))
         ?? context.pages()[0]
         ?? (await context.newPage());
       this.preparePage(page);
@@ -200,7 +223,7 @@ export class BrowserManager {
         const browser = await chromium.connectOverCDP(account.cdpUrl);
         const context = browser.contexts()[0];
         if (!context) throw new FlowError("browser_error", `No browser context was exposed at ${account.cdpUrl}.`);
-        const page = context.pages().find((candidate) => candidate.url().startsWith("https://labs.google/"))
+        const page = context.pages().find((candidate) => isFlowPageUrl(candidate.url()))
           ?? (await context.newPage());
         this.preparePage(page);
         this.browsers.set(accountId, { context, page, close: async () => undefined });
@@ -226,6 +249,8 @@ export class BrowserManager {
         "--profile-directory=Default",
         "--no-first-run",
         "--no-default-browser-check",
+        // Flow is responsive: a narrow window serves a compact layout without the settings controls.
+        "--window-size=1440,900",
         ...(process.env.FLOW_MCP_HEADLESS === "1" || account.headlessAfterLogin ? ["--headless=new"] : []),
         `--app=${FLOW_URL}`,
       ];
@@ -246,7 +271,7 @@ export class BrowserManager {
         await closeManagedBrowser(browser, processHandle);
         throw new FlowError("browser_error", "Managed Chromium started without a usable browser context.");
       }
-      const page = context.pages().find((candidate) => candidate.url().startsWith("https://labs.google/"))
+      const page = context.pages().find((candidate) => isFlowPageUrl(candidate.url()))
         ?? context.pages()[0]
         ?? (await context.newPage());
       this.preparePage(page);
@@ -291,7 +316,7 @@ export class BrowserManager {
         sameSite: cookie.sameSite === "strict" ? "Strict" as const
           : cookie.sameSite === "lax" ? "Lax" as const
             : "None" as const,
-        ...(cookie.expirationDate && cookie.expirationDate > 0 ? { expires: cookie.expirationDate } : {}),
+        expires: persistentExpiry(cookie.expirationDate),
       };
       if (cookie.hostOnly) {
         const host = cookie.domain.replace(/^\./, "");

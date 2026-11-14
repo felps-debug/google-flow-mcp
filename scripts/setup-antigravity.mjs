@@ -120,8 +120,8 @@ export async function setupAntigravity({ repoRoot = defaultRepoRoot, configPath 
       "In Antigravity: Settings > Customizations > Installed MCP Servers > Refresh.",
       "In normal Chromium: remove any Flow Login Bridge loaded from a different folder, open chrome://extensions, enable Developer mode, choose Load unpacked, and select extensionDirectory.",
       "Ask the agent: Connect my Google Flow account.",
-      "The agent must call flow_begin_account_connection and then tell you to open Flow Login Bridge and click Connect Flow.",
-      "Reply connected only after the extension popup says the session was sent; then select your existing Google account in the temporary chooser.",
+      "The agent calls flow_connect and tells you to open Flow Login Bridge and click Connect Flow.",
+      "Then select your existing Google account in the temporary chooser. No confirmation message is needed.",
     ],
     forbiddenInstallerActions: [
       "Do not edit repository source files.",

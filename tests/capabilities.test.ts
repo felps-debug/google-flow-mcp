@@ -15,3 +15,10 @@ test("parses structural duration and output labels", () => {
   assert.equal(parseDurationSeconds("Vídeo · 8s"), 8);
   assert.equal(parseDurationSeconds("Video · 10 sec"), 10);
 });
+
+test("icon names are stripped from video model labels", () => {
+  assert.equal(cleanCapabilityLabel("volume_up Veo 3.1 - Fast"), "Veo 3.1 - Fast");
+  assert.equal(normalizeCapabilityId("volume_up Omni 1.1 Flash"), "omni-1-1-flash");
+  assert.equal(normalizeCapabilityId("volume_up Veo 3.1 - Lite"), "veo-3-1-lite");
+  assert.equal(cleanCapabilityLabel("crop_16_9 16:9"), "16:9");
+});

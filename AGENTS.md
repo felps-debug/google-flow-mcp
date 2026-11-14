@@ -29,11 +29,9 @@ After it succeeds:
 1. Tell the user to open **Settings → Customizations → Installed MCP Servers** and click **Refresh**.
 2. Tell the user to load the exact `extensionDirectory` printed by the installer through Chromium's **Load unpacked** action.
 3. Ask the user to request: **Connect my Google Flow account.**
-4. Use `flow_begin_account_connection`. Show its instructions and stop.
-5. Wait for the user to click **Connect Flow** in the extension and reply **connected**.
-6. Tell the user that a temporary Google chooser will open and they should click their desired existing account.
-7. Use `flow_complete_account_connection`.
-8. Confirm readiness only after `flow_list_accounts` reports a connected `defaultAccountId`.
+4. Use `flow_connect`. It returns the steps for the user; tell them right away.
+5. Immediately call `flow_connect` again. That call waits while the user clicks **Connect Flow** in the extension and then clicks their desired existing account in Google's temporary chooser. Do not ask the user to reply "connected".
+6. Confirm readiness only after `flow_connect` returns `status=connected` and `flow_list_accounts` reports a connected `defaultAccountId`.
 
 ## Forbidden installer behavior
 
@@ -45,7 +43,7 @@ After it succeeds:
 - Never replace the user's entire `mcp_config.json`; preserve unrelated MCP servers.
 - Never use generic browser/computer-use tools to operate the Flow website.
 - Never click or ask the user to click Flow's generation-approval choices. The MCP persists and verifies Flow Agent's `AUTO_APPROVE` setting and handles the persistent approval fallback internally.
-- Never invoke account completion before the user confirms that the extension popup says the session was sent.
+- Never ask the user to confirm the extension click before calling `flow_connect` again; the waiting call detects it.
 
 If a hard requirement fails, report the exact failing prerequisite. Do not patch the published source as an installation workaround.
 

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Flow Login Bridge",
-  "version": "0.1.0",
+  "version": "0.2.4",
   "description": "Connect Google accounts already signed into Chromium to your local Flow MCP server.",
   "homepage_url": "https://github.com/retrolyze52/google-flow-mcp",
   "permissions": ["cookies"],
@@ -11,8 +11,20 @@
     "https://labs.google/*",
     "http://127.0.0.1/*"
   ],
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
   "action": {
     "default_title": "Connect Google Flow",
-    "default_popup": "popup.html"
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
   }
 }

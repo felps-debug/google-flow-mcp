@@ -31,8 +31,7 @@ test("MCP server exposes the intended Flow tools", async (context) => {
   assert.deepEqual(
     listed.tools.map((tool) => tool.name).sort(),
     [
-      "flow_begin_account_connection",
-      "flow_complete_account_connection",
+      "flow_connect",
       "flow_download_job",
       "flow_generate_image",
       "flow_generate_video",
@@ -40,7 +39,6 @@ test("MCP server exposes the intended Flow tools", async (context) => {
       "flow_inspect_account",
       "flow_job_status",
       "flow_list_accounts",
-      "flow_login_bridge_status",
       "flow_upscale_video",
     ],
   );
@@ -56,17 +54,23 @@ test("MCP server exposes the intended Flow tools", async (context) => {
   assert.equal(help.isError, undefined);
   assert.match((help.content[0] as { type: "text"; text: string }).text, /Create Google Flow videos and images/);
   assert.match((help.content[0] as { type: "text"; text: string }).text, /exampleRequests/);
-  const begin = await client.callTool({ name: "flow_begin_account_connection", arguments: { accountId: "personal" } });
-  assert.equal(begin.isError, undefined);
-  const beginText = (begin.content[0] as { type: "text"; text: string }).text;
-  assert.match(beginText, /USER_ACTION_REQUIRED/);
-  assert.match(beginText, /STOP NOW/);
-  assert.match(beginText, /flow_complete_account_connection/);
-  const connectionId = (JSON.parse(beginText) as { connectionId: string }).connectionId;
-  const prematureComplete = await client.callTool({
-    name: "flow_complete_account_connection",
-    arguments: { connectionId, userConfirmedSessionSent: true, accountId: "personal" },
-  });
-  assert.equal(prematureComplete.isError, true);
-  assert.match((prematureComplete.content[0] as { type: "text"; text: string }).text, /has not sent the browser session/);
+  const first = await client.callTool({ name: "flow_connect", arguments: { accountId: "personal" } });
+  assert.equal(first.isError, undefined);
+  const firstBody = JSON.parse((first.content[0] as { type: "text"; text: string }).text) as {
+    status: string;
+    phase: string;
+    userMessage: string[];
+    agentInstruction: string;
+  };
+  assert.equal(firstBody.status, "awaiting_user");
+  assert.equal(firstBody.phase, "awaiting_extension");
+  assert.ok(firstBody.userMessage.length >= 2);
+  assert.match(firstBody.agentInstruction, /IMMEDIATELY call flow_connect again/);
+  assert.doesNotMatch(firstBody.agentInstruction, /wait for the user to reply/i);
+
+  // A second call keeps waiting on the same connection instead of starting a new one.
+  const second = await client.callTool({ name: "flow_connect", arguments: { waitSeconds: 1 } });
+  const secondBody = JSON.parse((second.content[0] as { type: "text"; text: string }).text) as { status: string; connectionId: string };
+  assert.equal(secondBody.status, "awaiting_user");
+  assert.equal(secondBody.connectionId, (JSON.parse((first.content[0] as { type: "text"; text: string }).text) as { connectionId: string }).connectionId);
 });

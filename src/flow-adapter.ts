@@ -14,7 +14,7 @@ import {
   selectNewMedia,
   type MediaSnapshot,
 } from "./media-selection.js";
-import { canonicalFlowProjectUrl } from "./navigation.js";
+import { canonicalFlowProjectUrl, FLOW_PROJECT_LINK_SELECTOR, isFlowPageUrl, isFlowProjectUrl } from "./navigation.js";
 import { safeFileStem } from "./paths.js";
 import { FlowStore } from "./store.js";
 import {
@@ -32,6 +32,11 @@ import {
   type UpscaleFactor,
 } from "./types.js";
 
+// Flow renders Material icons as <mat-icon class="google-symbols">; older builds used <i>.
+const ICON = "i, .google-symbols";
+// Generation settings are tabs in older Flow builds and mat-button-toggle radio groups in current ones.
+const OPTION_GROUP = '[role="tablist"], [role="radiogroup"]';
+const OPTION_ITEM = '[role="tab"], [role="radio"]';
 const LOGIN_TEXT = /sign in|choose an account|use your google account/i;
 const FAILURE_TEXT = /generation failed|couldn't generate|unable to generate|not enough (?:ai )?credits|blocked by policy|try again|no se (?:ha podido|pudo) generar|error al generar|puntos insuficientes|int[eé]ntalo de nuevo/i;
 
@@ -123,12 +128,15 @@ export class FlowAdapter {
       chooseGoogleAccount?: boolean;
       waitForBridgeSeconds?: number;
       waitForAccountSelectionSeconds?: number;
+      onPhase?: (phase: "awaiting_account_choice" | "verifying") => void;
+      /** Skip the cookie bridge: the user signs in by hand in the isolated browser window. */
+      manualLogin?: boolean;
     } = {},
   ): Promise<string> {
     const attached = options.browserMode === "attach_cdp";
     const bridgeWaitSeconds = options.waitForBridgeSeconds ?? 15;
     const selectionWaitSeconds = options.waitForAccountSelectionSeconds ?? 300;
-    const transferred = attached ? undefined : await this.cookieBridge.waitForSession(bridgeWaitSeconds);
+    const transferred = attached || options.manualLogin ? undefined : await this.cookieBridge.waitForSession(bridgeWaitSeconds);
     const id = accountId ?? await this.store.availableAccountId(transferred?.profile || "flow-account");
     const accountAlreadyExisted = (await this.store.listAccounts()).accounts.some((item) => item.id === id);
     const account = await this.store.ensureAccount(id, label ?? transferred?.profile, {
@@ -142,7 +150,9 @@ export class FlowAdapter {
       const page = transferred
         ? await this.browsers.importCookies(account.id, transferred.cookies)
         : await this.browsers.pageFor(account.id);
-      const startUrl = options.chooseGoogleAccount
+      const startUrl = options.manualLogin
+        ? `https://accounts.google.com/ServiceLogin?continue=${encodeURIComponent("https://myaccount.google.com/")}`
+        : options.chooseGoogleAccount
         // Google rejects labs.google as a direct AccountChooser continuation
         // with HTTP 400. Use the supported Google Account destination, then
         // navigate to Flow after the user selects an existing account.
@@ -150,6 +160,7 @@ export class FlowAdapter {
         : FLOW_URL;
       await page.goto(startUrl, { waitUntil: "domcontentloaded" });
       await this.store.touchAccount(account.id);
+      if (options.chooseGoogleAccount) options.onPhase?.("awaiting_account_choice");
       const deadline = Date.now() + selectionWaitSeconds * 1_000;
       let chooserCompleted = !options.chooseGoogleAccount;
       let access = chooserCompleted
@@ -160,12 +171,13 @@ export class FlowAdapter {
         await page.waitForTimeout(1_000);
         if (!chooserCompleted && /^https:\/\/myaccount\.google\.com(?:\/|$)/i.test(page.url())) {
           chooserCompleted = true;
+          options.onPhase?.("verifying");
           await page.goto(FLOW_URL, { waitUntil: "domcontentloaded" });
         }
         access = await this.pageAccessState(page);
         if (chooserCompleted && access.signedIn && !access.workspaceAvailable) {
           noWorkspaceSince ??= Date.now();
-          if (Date.now() - noWorkspaceSince >= 5_000) break;
+          if (Date.now() - noWorkspaceSince >= 20_000) break;
         } else {
           noWorkspaceSince = undefined;
         }
@@ -178,7 +190,7 @@ export class FlowAdapter {
           "flow_access_unavailable",
           message,
           [
-            "Restart with flow_begin_account_connection, wait for the user's extension click, then call flow_complete_account_connection for an account that has Flow access.",
+            "Call flow_connect again and ask the user to pick a Google account that has Flow access.",
             "Do not open, scroll, or automate the landing page with generic browser/computer-use tools.",
           ],
         );
@@ -190,13 +202,18 @@ export class FlowAdapter {
         throw new FlowError(
           "login_required",
           message,
-          ["Restart with flow_begin_account_connection and follow its user-confirmed two-step workflow."],
+          ["Call flow_connect again, then ask the user to click Connect Flow in the extension and pick the Google account."],
         );
       }
       const currentUrl = page.url();
+      let autoApproveWarning: string | undefined;
       if (access.workspaceAvailable) {
         await this.openProject(page);
-        await this.ensureAgentAutoApprove(page);
+        // Auto-approve is re-verified before every generation; a UI change here must not block the login.
+        await this.ensureAgentAutoApprove(page).catch((error: unknown) => {
+          if (!(error instanceof FlowError && error.code === "ui_changed")) throw error;
+          autoApproveWarning = error.message;
+        });
         await this.store.markAccountConnected(account.id);
       }
       if (access.workspaceAvailable && !attached) {
@@ -209,6 +226,7 @@ export class FlowAdapter {
           ? `Attached to Chromium CDP: ${account.cdpUrl}`
           : `Connected through Flow Login Bridge (${transferred?.cookies.length ?? 0} Google session cookies transferred locally).`,
         `Current URL: ${currentUrl}`,
+        ...(autoApproveWarning ? [`Warning: ${autoApproveWarning} Generation will retry this setting.`] : []),
         access.workspaceAvailable
           ? attached
             ? "The session is signed in and ready. The attached browser remains open."
@@ -270,7 +288,7 @@ export class FlowAdapter {
           ...agentCapabilities.ratios.image,
           ...agentCapabilities.ratios.video,
         ];
-        const back = await lastVisible(page.locator("button").filter({ has: page.locator("i", { hasText: /^arrow_back$/ }) }));
+        const back = await lastVisible(page.locator("button").filter({ has: page.locator(ICON, { hasText: /^arrow_back$/ }) }));
         if (back) await back.click().catch(() => undefined);
       } else {
         const settings = await firstVisible([
@@ -333,8 +351,17 @@ export class FlowAdapter {
         page = await this.readyPage(account.id, true);
         await this.store.updateJob(job, "configuring", { flowProjectUrl: page.url() });
         await this.openProject(page, request.flowProject);
-        await this.ensureAgentAutoApprove(page);
-        await this.store.updateJob(job, "configuring", { creditConfirmationMode: "auto_approve" });
+        if (request.referenceFiles.length) {
+          // Attachments from an earlier run survive in the prompt bar; a reload starts from a clean one.
+          await page.reload({ waitUntil: "domcontentloaded" });
+          await this.openProject(page, request.flowProject);
+        }
+        // clickGenerate approves a credit confirmation itself, so a missing auto-approve control is not fatal.
+        const autoApproved = await this.ensureAgentAutoApprove(page).then(() => true, (error: unknown) => {
+          if (error instanceof FlowError && error.code === "ui_changed") return false;
+          throw error;
+        });
+        await this.store.updateJob(job, "configuring", autoApproved ? { creditConfirmationMode: "auto_approve" } : {});
         await this.configureGeneration(page, request);
         await this.attachReferences(page, request.referenceFiles);
         await this.fillPrompt(
@@ -445,7 +472,7 @@ export class FlowAdapter {
 
   private async readyPage(accountId: string, requireLogin: boolean, url?: string): Promise<Page> {
     const page = await this.browsers.pageFor(accountId);
-    if (!page.url().startsWith("https://labs.google/")) {
+    if (!isFlowPageUrl(page.url())) {
       await page.goto(url || FLOW_URL, { waitUntil: "domcontentloaded" });
     } else if (url && page.url() !== url) {
       await page.goto(url, { waitUntil: "domcontentloaded" });
@@ -459,7 +486,7 @@ export class FlowAdapter {
           "login_required",
           `Google Flow account '${accountId}' is not signed in.`,
           [
-            `Call flow_begin_account_connection, tell the user to click Connect Flow in the extension, then call flow_complete_account_connection with accountId '${accountId}'.`,
+            `Call flow_connect with accountId '${accountId}', then tell the user to click Connect Flow in the extension and pick the Google account.`,
             "Never substitute generic browser/computer-use automation for the MCP login or generation tools.",
           ],
         );
@@ -471,7 +498,7 @@ export class FlowAdapter {
           "flow_access_unavailable",
           message,
           [
-            "Restart the flow_begin_account_connection and flow_complete_account_connection workflow and select an account that has Flow access.",
+            "Call flow_connect again and ask the user to pick a Google account that has Flow access.",
             "Do not open, scroll, click, or automate the public Flow page with browser/computer-use tools.",
           ],
         );
@@ -498,10 +525,10 @@ export class FlowAdapter {
   }
 
   private async hasWorkspace(page: Page): Promise<boolean> {
-    if (/\/tools\/flow\/project\//i.test(page.url())) return true;
+    if (isFlowProjectUrl(page.url())) return true;
     if (await firstVisible([this.promptLocator(page)])) return true;
-    if (await page.locator('a[href*="/tools/flow/project/"]').count().catch(() => 0)) return true;
-    const createControls = page.locator("button").filter({ has: page.locator("i", { hasText: /^add_2$/ }) });
+    if (await page.locator(FLOW_PROJECT_LINK_SELECTOR).count().catch(() => 0)) return true;
+    const createControls = page.locator("button").filter({ has: page.locator(ICON, { hasText: /^add(?:_2)?$/ }) });
     return (await createControls.count().catch(() => 0)) > 0;
   }
 
@@ -540,12 +567,13 @@ export class FlowAdapter {
       await page.waitForTimeout(1_000);
     }
     if (await firstVisible([this.promptLocator(page)])) return;
+    // Already inside a project (for example right after a reload): wait for its prompt instead of the project list.
+    if (!projectName && isFlowProjectUrl(page.url()) && await this.waitForPrompt(page, 20_000)) return;
 
-    await Promise.race([
-      page.locator('a[href*="/tools/flow/project/"]').first().waitFor({ state: "visible", timeout: 8_000 }),
-      page.locator("button").filter({ has: page.locator("i", { hasText: /^add_2$/ }) }).last()
-        .waitFor({ state: "visible", timeout: 8_000 }),
-    ]).catch(() => undefined);
+    // Wait for the project list itself: the New project button renders first and would otherwise win,
+    // creating an empty project on every call instead of reusing an existing one.
+    await page.locator(FLOW_PROJECT_LINK_SELECTOR).first()
+      .waitFor({ state: "visible", timeout: 12_000 }).catch(() => undefined);
 
     if (projectName) {
       const project = await firstVisible([
@@ -560,7 +588,7 @@ export class FlowAdapter {
     }
 
     const recentProject = await firstVisible([
-      page.locator('a[href*="/tools/flow/project/"]').last(),
+      page.locator(FLOW_PROJECT_LINK_SELECTOR).last(),
     ]);
     if (recentProject) {
       await recentProject.click();
@@ -570,14 +598,14 @@ export class FlowAdapter {
     const create = await firstVisible([
       page.getByRole("button", { name: /new project|create project|start.*project/i }),
       page.getByRole("button", { name: /nuevo proyecto|crear proyecto/i }),
-      page.locator("button").filter({ has: page.locator("i", { hasText: /^add_2$/ }) }).last(),
+      page.locator("button").filter({ has: page.locator(ICON, { hasText: /^add(?:_2)?$/ }) }).last(),
       page.getByText(/\+\s*new project|new project/i),
     ]);
     if (!create) {
       throw new FlowError(
         "ui_changed",
         "Could not find a Flow project or the New project control.",
-        ["Reconnect with flow_begin_account_connection and flow_complete_account_connection, then retry."],
+        ["Reconnect with flow_connect, then retry."],
       );
     }
     await create.click();
@@ -645,25 +673,89 @@ export class FlowAdapter {
   }
 
   private async openAgentSettings(page: Page): Promise<boolean> {
+    const ratioGroups = () => page.locator(OPTION_GROUP).filter({ hasText: /(?:16:9|9:16|1:1|4:3|3:4)/ });
+    await this.dismissOverlays(page);
     const tune = await firstVisible([
-      page.locator("button").filter({ has: page.locator("i", { hasText: /^tune$/ }) }),
-      page.locator("button").filter({ has: page.locator("i", { hasText: /^settings_2$/ }) }),
+      page.locator("button").filter({ has: page.locator(ICON, { hasText: /^tune$/ }) }),
     ]);
-    if (!tune) return false;
-    await tune.click();
+    // Without Agent mode the generation settings live in one chip with the media type or model, the ratio
+    // icon and the count ("Video · 720p · 8s", "Nano Banana 2.1 x2"); the ratio icon is its stable part.
+    const chip = await firstVisible([
+      page.locator('button:not([role="radio"])')
+        .filter({ has: page.locator(ICON, { hasText: /^crop_/ }) })
+        .last(),
+    ]);
+    const opener = tune ?? chip;
+    if (!opener) return false;
+    await opener.click();
+    await page.waitForTimeout(500);
+    const opened = (await visibleCount(ratioGroups())) >= 1;
+    await page.screenshot({ path: this.store.diagnosticPath(`inspect-settings-panel-${opened ? "open" : "unrecognized"}`), fullPage: false }).catch(() => undefined);
+    if (!opened) {
+      // Record what the panel actually contains so selectors can be fixed from evidence instead of guesses.
+      const structure = await page.evaluate(() => {
+        const visible = (element: Element) => { const box = element.getBoundingClientRect(); return box.width > 0 && box.height > 0; };
+        return [...document.querySelectorAll('button, [role], mat-icon')].filter(visible).slice(0, 150).map((element) => ({
+          tag: element.tagName.toLowerCase(),
+          role: element.getAttribute("role"),
+          aria: element.getAttribute("aria-label"),
+          popup: element.getAttribute("aria-haspopup"),
+          text: ((element as HTMLElement).innerText || element.textContent || "").replace(/\s+/g, " ").trim().slice(0, 60),
+        }));
+      }).catch(() => []);
+      await writeFile(this.store.diagnosticPath("inspect-settings-panel-dom", "json"), JSON.stringify(structure, null, 1), "utf8").catch(() => undefined);
+    }
+    return opened;
+  }
+
+  // The generation popover shows one media type at a time behind an Image | Video toggle. The toggle is the
+  // only option group with two items and no digits (ratios and counts contain digits).
+  private async modeToggleItems(page: Page): Promise<Locator | null> {
+    const groups = page.locator(OPTION_GROUP);
+    const count = await groups.count();
+    for (let index = 0; index < count; index += 1) {
+      const group = groups.nth(index);
+      if (!(await group.isVisible().catch(() => false))) continue;
+      const items = group.locator(OPTION_ITEM);
+      if ((await items.count()) !== 2) continue;
+      if (/[0-9]/.test(await group.innerText().catch(() => "0"))) continue;
+      return items;
+    }
+    return null;
+  }
+
+  private async selectMode(page: Page, items: Locator, media: MediaType): Promise<void> {
+    await items.nth(media === "image" ? 0 : 1).click();
     await page.waitForTimeout(400);
-    return (await page.locator('[role="tablist"]').count()) >= 2;
   }
 
   private async readAgentSettings(page: Page, durationHints: number[]): Promise<AgentSettingsCapabilities> {
+    const toggle = await this.modeToggleItems(page);
+    if (!toggle) return this.readSettingsSurface(page, durationHints);
+    await this.selectMode(page, toggle, "image");
+    const image = await this.readSettingsSurface(page, []);
+    await this.selectMode(page, toggle, "video");
+    const video = await this.readSettingsSurface(page, []);
+    await this.selectMode(page, toggle, "image");
+    return {
+      models: { image: image.models.image, video: video.models.image },
+      ratios: { image: image.ratios.image, video: video.ratios.image },
+      outputs: { image: image.outputs.image, video: video.outputs.image },
+      durationSeconds: video.durationSeconds,
+    };
+  }
+
+  private async readSettingsSurface(page: Page, durationHints: number[]): Promise<AgentSettingsCapabilities> {
     const ratioGroups: string[][] = [];
     const outputGroups: number[][] = [];
-    const tablists = page.locator('[role="tablist"]');
+    const labelDurations: number[] = [];
+    const tablists = page.locator(OPTION_GROUP);
     const tablistCount = await tablists.count();
     for (let index = 0; index < tablistCount; index += 1) {
       const list = tablists.nth(index);
       if (!(await list.isVisible().catch(() => false))) continue;
-      const labels = await visibleText(list.locator('[role="tab"]'));
+      const labels = await visibleText(list.locator(OPTION_ITEM));
+      labelDurations.push(...labels.map(parseDurationSeconds).filter((value): value is number => value !== undefined));
       const ratios = unique(labels.flatMap((label) => label.match(/\b(?:16:9|9:16|1:1|4:3|3:4)\b/g) ?? []));
       if (ratios.length) ratioGroups.push(ratios);
       const outputs = uniqueNumbers(labels.map(parseOutputCount).filter((value): value is number => value !== undefined));
@@ -706,7 +798,7 @@ export class FlowAdapter {
         image: outputGroups[0] ?? [],
         video: outputGroups.at(-1) ?? [],
       },
-      durationSeconds: uniqueNumbers(durationHints),
+      durationSeconds: uniqueNumbers([...durationHints, ...labelDurations]),
     };
   }
 
@@ -715,6 +807,11 @@ export class FlowAdapter {
     request: GenerationRequest,
     durationHints: number[],
   ): Promise<void> {
+    const modeItems = await this.modeToggleItems(page);
+    if (modeItems) {
+      await this.configurePopoverGeneration(page, request, modeItems);
+      return;
+    }
     const capabilities = await this.readAgentSettings(page, durationHints);
     const media = request.mediaType;
     const modelOptions = capabilities.models[media];
@@ -783,6 +880,77 @@ export class FlowAdapter {
     await page.waitForTimeout(500);
   }
 
+  private async configurePopoverGeneration(page: Page, request: GenerationRequest, modeItems: Locator): Promise<void> {
+    const media = request.mediaType;
+    await this.selectMode(page, modeItems, media);
+    const current = await this.readSettingsSurface(page, []);
+    const modelOptions = current.models.image;
+    if (request.model && request.model !== "ui-default") {
+      const requestedId = normalizeCapabilityId(request.model);
+      const requested = modelOptions.find((option) => option.id === requestedId);
+      if (!requested) {
+        throw new FlowError(
+          "unsupported_option",
+          `Model '${request.model}' is not offered for ${media} generation.`,
+          modelOptions.map((option) => `${option.id} (${option.label})`),
+        );
+      }
+      if (!requested.selected) {
+        const dropdown = await firstVisible([
+          page.locator('button[aria-haspopup="menu"]').filter({ hasText: /banana|omni|veo|imagen/i }).first(),
+        ]);
+        if (!dropdown) throw new FlowError("ui_changed", `Could not find the ${media} model dropdown.`);
+        await dropdown.click();
+        await page.waitForTimeout(200);
+        const items = page.locator('[role="menuitem"]');
+        const count = await items.count();
+        let chosen = false;
+        for (let index = 0; index < count && !chosen; index += 1) {
+          const item = items.nth(index);
+          if (!await item.isVisible().catch(() => false)) continue;
+          if (normalizeCapabilityId(await item.innerText().catch(() => "")) === requestedId) {
+            await item.click();
+            chosen = true;
+          }
+        }
+        if (!chosen) throw new FlowError("ui_changed", `Flow listed '${requested.label}', but its menu item disappeared.`);
+        await page.waitForTimeout(300);
+      }
+    }
+    if (request.aspectRatio && request.aspectRatio !== "ui-default") {
+      await this.chooseAgentTab(page, request.aspectRatio, "image", "aspect ratio", (label) => label.includes(":"));
+    }
+    await this.chooseAgentTab(
+      page,
+      String(request.outputs),
+      "image",
+      "output count",
+      (label) => label.split(" ").some((part) => parseOutputCount(part) !== undefined),
+      (label) => parseOutputCount(label) === request.outputs,
+    );
+    if (media === "video" && request.durationSeconds) {
+      if (!current.durationSeconds.includes(request.durationSeconds)) {
+        throw new FlowError(
+          "unsupported_option",
+          current.durationSeconds.length
+            ? `The current video configuration offers ${current.durationSeconds.join(", ")} seconds, not ${request.durationSeconds} seconds.`
+            : "Flow does not expose a selectable video duration here. Omit durationSeconds to use the model's default.",
+        );
+      }
+      await this.chooseAgentTab(
+        page,
+        String(request.durationSeconds),
+        "image",
+        "duration",
+        (label) => label.split(" ").some((part) => parseDurationSeconds(part) !== undefined),
+        (label) => parseDurationSeconds(label) === request.durationSeconds,
+      );
+    }
+    // Popover changes apply immediately; there is no Save control (the last button on the page is Generate).
+    await page.keyboard.press("Escape").catch(() => undefined);
+    await page.waitForTimeout(300);
+  }
+
   private async chooseAgentTab(
     page: Page,
     requested: string,
@@ -792,7 +960,7 @@ export class FlowAdapter {
     choicePredicate: (text: string) => boolean = (text) => cleanCapabilityLabel(text) === requested,
   ): Promise<void> {
     const groups: Locator[] = [];
-    const tablists = page.locator('[role="tablist"]');
+    const tablists = page.locator(OPTION_GROUP);
     const count = await tablists.count();
     for (let index = 0; index < count; index += 1) {
       const list = tablists.nth(index);
@@ -802,7 +970,7 @@ export class FlowAdapter {
     }
     const group = media === "image" ? groups[0] : groups.at(-1);
     if (!group) throw new FlowError("unsupported_option", `Flow did not expose a ${media} ${label} control.`);
-    const tabs = group.locator('[role="tab"]');
+    const tabs = group.locator(OPTION_ITEM);
     const tabCount = await tabs.count();
     for (let index = 0; index < tabCount; index += 1) {
       const tab = tabs.nth(index);
@@ -854,22 +1022,92 @@ export class FlowAdapter {
     return true;
   }
 
+  // An open popover or menu puts a backdrop over the page that swallows clicks on the controls underneath.
+  private async dismissOverlays(page: Page): Promise<void> {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      if (!(await firstVisible([page.locator(".cdk-overlay-backdrop-showing")]).catch(() => null))
+        && (await page.locator(".cdk-overlay-backdrop-showing").count().catch(() => 0)) === 0) return;
+      await page.keyboard.press("Escape").catch(() => undefined);
+      await page.waitForTimeout(300);
+      // A modal can ignore Escape; clicking the backdrop outside it closes it the way a user would.
+      if ((await page.locator(".cdk-overlay-backdrop-showing").count().catch(() => 0)) > 0) {
+        await page.locator(".cdk-overlay-backdrop-showing").last().click({ position: { x: 2, y: 2 }, timeout: 1_500 }).catch(() => undefined);
+        await page.waitForTimeout(300);
+      }
+    }
+  }
+
   private async attachReferences(page: Page, files: string[]): Promise<void> {
     if (!files.length) return;
     for (const file of files) await access(file);
-    let input = page.locator('input[type="file"]');
-    if ((await input.count()) === 0) {
-      const add = await firstVisible([
-        page.getByRole("button", { name: /add.*(?:image|media|ingredient|reference|frame)|upload/i }),
-        page.getByText(/add.*(?:image|media|ingredient|reference|frame)|upload/i),
+    const input = page.locator('input[type="file"]');
+    if ((await input.count()) > 0) {
+      await input.last().setInputFiles(files);
+      await page.waitForTimeout(1_000);
+      return;
+    }
+    // Current Flow: the prompt bar's add button opens a media picker over the project gallery. Its upload
+    // button raises the native file chooser (there is no <input type="file"> to fill), the uploaded file
+    // appears in the picker's list, and selecting it reveals an "Add to prompt" button.
+    await this.openMediaPicker(page);
+    // Reuse a file already uploaded to the project under the same name instead of uploading a duplicate.
+    await page.waitForTimeout(1_000);
+    const missing: string[] = [];
+    for (const file of files) {
+      const known = await page.locator('button[role="option"]', { hasText: path.basename(file) }).count().catch(() => 0);
+      if (known === 0) missing.push(file);
+    }
+    if (missing.length) {
+      const upload = page.locator("button").filter({ has: page.locator(ICON, { hasText: /^upload$/ }) });
+      const uploadButton = await firstVisible([upload]);
+      if (!uploadButton) throw new FlowError("ui_changed", "Flow's media picker did not offer an upload control.");
+      const [chooser] = await Promise.all([
+        page.waitForEvent("filechooser", { timeout: 10_000 }),
+        uploadButton.click(),
       ]);
-      if (add) await add.click();
-      input = page.locator('input[type="file"]');
+      await chooser.setFiles(missing);
     }
-    if ((await input.count()) === 0) {
-      throw new FlowError("ui_changed", "Reference files were supplied, but Flow's file input could not be found.");
+    for (const [index, file] of files.entries()) {
+      if (index > 0) await this.openMediaPicker(page);
+      await this.addUploadedToPrompt(page, path.basename(file));
     }
-    await input.last().setInputFiles(files);
+  }
+
+  private async openMediaPicker(page: Page): Promise<void> {
+    await this.dismissOverlays(page);
+    const add = await firstVisible([
+      page.locator("button").filter({ has: page.locator(ICON, { hasText: /^add$/ }) }).last(),
+    ]);
+    if (!add) throw new FlowError("ui_changed", "Could not find the control that adds media to the prompt.");
+    await add.click();
+    const upload = page.locator("button").filter({ has: page.locator(ICON, { hasText: /^upload$/ }) });
+    await upload.first().waitFor({ state: "visible", timeout: 10_000 }).catch(() => undefined);
+  }
+
+  private async addUploadedToPrompt(page: Page, fileName: string): Promise<void> {
+    // Picker rows are button[role=option]; the gallery behind the picker repeats the name on other tiles.
+    const row = page.locator('button[role="option"]', { hasText: fileName }).first();
+    await row.waitFor({ state: "visible", timeout: 60_000 }).catch(() => {
+      throw new FlowError("ui_changed", `The uploaded file '${fileName}' did not appear in Flow's media picker.`);
+    });
+    await row.click();
+    const addToPrompt = page.getByRole("button", { name: /add to prompt|(?:adicionar|incluir|inserir) (?:ao|no|na) (?:comando|prompt)|a[ñn]adir al/i }).first();
+    const preview = await addToPrompt.waitFor({ state: "visible", timeout: 6_000 }).then(() => true, () => false);
+    if (!preview) {
+      // Some Flow layouts attach the asset as soon as its row is clicked and close the picker.
+      await page.waitForTimeout(1_000);
+      if (await page.locator('button[role="option"]').first().isVisible().catch(() => false)) {
+        throw new FlowError("ui_changed", "Flow's media picker did not show its Add to prompt control.");
+      }
+      return;
+    }
+    // The control stays disabled until the upload finishes processing.
+    const deadline = Date.now() + 90_000;
+    while (!(await addToPrompt.isEnabled().catch(() => false))) {
+      if (Date.now() > deadline) throw new FlowError("generation_failed", `Flow did not finish uploading '${fileName}'.`);
+      await page.waitForTimeout(1_000);
+    }
+    await addToPrompt.click();
     await page.waitForTimeout(1_000);
   }
 
@@ -890,11 +1128,15 @@ export class FlowAdapter {
     const openSettings = async (): Promise<Locator> => {
       const alreadyOpen = await firstVisible([page.locator('[role="radio"][value="AUTO_APPROVE"]')]);
       if (alreadyOpen) return alreadyOpen;
-      const settings = await firstVisible([
-        page.locator("button").filter({ has: page.locator("i", { hasText: /^tune$/ }) }).last(),
-      ]);
+      const tuneButton = page.locator("button").filter({ has: page.locator(ICON, { hasText: /^tune$/ }) }).last();
+      await tuneButton.waitFor({ state: "visible", timeout: 15_000 }).catch(() => undefined);
+      const settings = await firstVisible([tuneButton]);
       if (!settings) {
-        throw new FlowError("ui_changed", "Flow Agent settings could not be opened to disable repeated credit confirmations.");
+        const icons = await visibleText(page.locator(`button ${ICON.split(", ").join(", button ")}`)).catch(() => [] as string[]);
+        throw new FlowError(
+          "ui_changed",
+          `Flow Agent settings could not be opened to disable repeated credit confirmations. URL: ${page.url()}. Visible button icons: ${icons.slice(0, 30).join(", ") || "none"}.`,
+        );
       }
       await settings.click();
       await page.waitForTimeout(300);
@@ -906,7 +1148,7 @@ export class FlowAdapter {
     };
     const closeSettings = async (): Promise<void> => {
       const close = await firstVisible([
-        page.locator("button").filter({ has: page.locator("i", { hasText: /^close$/ }) }).last(),
+        page.locator("button").filter({ has: page.locator(ICON, { hasText: /^close$/ }) }).last(),
       ]);
       if (close) await close.click();
       else await page.keyboard.press("Escape").catch(() => undefined);
@@ -916,7 +1158,7 @@ export class FlowAdapter {
     let autoApprove = await openSettings();
     if (await autoApprove.getAttribute("aria-checked") !== "true") {
       await autoApprove.click();
-      const save = await lastVisible(page.locator("button:not([role])").filter({ hasNot: page.locator("i") }));
+      const save = await lastVisible(page.locator("button:not([role])").filter({ hasNot: page.locator(ICON) }));
       if (!save) {
         throw new FlowError("ui_changed", "Flow Agent settings did not expose its Save control.");
       }
@@ -934,12 +1176,12 @@ export class FlowAdapter {
 
   private async clickGenerate(page: Page, mediaType: MediaType, mediaBaseline: number): Promise<void> {
     const agentUi = Boolean(await firstVisible([
-      page.locator("button").filter({ has: page.locator("i", { hasText: /^tune$/ }) }),
+      page.locator("button").filter({ has: page.locator(ICON, { hasText: /^tune$/ }) }),
     ]));
-    const checkIcons = page.locator("i.google-symbols").filter({ hasText: /^check$/ });
+    const checkIcons = page.locator(ICON).filter({ hasText: /^check$/ });
     const approvalBaseline = await visibleCount(checkIcons);
     const button = await firstVisible([
-      page.locator("button").filter({ has: page.locator("i", { hasText: /^arrow_forward$/ }) }).last(),
+      page.locator("button").filter({ has: page.locator(ICON, { hasText: /^arrow_forward$/ }) }).last(),
       page.getByRole("button", { name: /^generate(?: image| video)?$/i }).last(),
       page.getByRole("button", { name: /^(?:crear|generar)$/i }).last(),
       page.getByText(/^generate(?: image| video)?$/i),
@@ -974,7 +1216,7 @@ export class FlowAdapter {
     if (dialog) {
       const confirm = await lastVisible(dialog.locator("button"));
       if (confirm && await confirm.isEnabled().catch(() => false)) {
-        const icon = await confirm.locator("i").innerText().catch(() => "");
+        const icon = await confirm.locator(ICON).innerText().catch(() => "");
         if (!/^close$/i.test(icon.trim())) await confirm.click();
       }
     }
@@ -985,7 +1227,20 @@ export class FlowAdapter {
     return page.locator('img[src^="blob:"], img[src*="googleusercontent"], img[src*="ggpht"]');
   }
 
+  // Video tiles in the gallery show a thumbnail; Flow creates the <video> element (with its signed source)
+  // only once a tile is hovered, and keeps it afterwards. The grid is newest-first, so warm the first few.
+  private async warmVideoTiles(page: Page): Promise<void> {
+    const tiles = page.locator("flow-video-tile");
+    const count = Math.min(await tiles.count().catch(() => 0), 6);
+    for (let index = 0; index < count; index += 1) {
+      await tiles.nth(index).hover({ timeout: 2_000 }).catch(() => undefined);
+      await page.waitForTimeout(250);
+    }
+    if (count > 0) await page.mouse.move(0, 0).catch(() => undefined);
+  }
+
   private async mediaSnapshots(page: Page, type: MediaType): Promise<MediaSnapshot[]> {
+    if (type === "video") await this.warmVideoTiles(page);
     return this.mediaLocator(page, type).evaluateAll((elements) => elements.map((element, index) => {
       const keys: string[] = [];
       let sourceUrl: string | undefined;
@@ -1126,7 +1381,7 @@ export class FlowAdapter {
     await surface.dispatchEvent("contextmenu", { button: 2 });
     await page.waitForTimeout(300);
     const menuVisible = await firstVisible([
-      page.locator('[role="menuitem"]').filter({ has: page.locator("i.google-symbols", { hasText: /^download$/ }) }),
+      page.locator('[role="menuitem"]').filter({ has: page.locator(ICON, { hasText: /^download$/ }) }),
       page.locator('[role="menu"]'),
     ]);
     if (menuVisible) return;
@@ -1134,7 +1389,7 @@ export class FlowAdapter {
     await page.keyboard.press("Escape").catch(() => undefined);
     await surface.hover();
     const more = await firstVisible([
-      surface.locator("xpath=ancestor-or-self::*[position() <= 4]//button").filter({ has: page.locator("i.google-symbols", { hasText: /^more_vert$/ }) }).last(),
+      surface.locator("xpath=ancestor-or-self::*[position() <= 4]//button").filter({ has: page.locator(ICON, { hasText: /^more_vert$/ }) }).last(),
       page.getByRole("button", { name: /more|menu|options/i }).last(),
       page.locator('button[aria-label*="more" i], button[aria-label*="menu" i]').last(),
     ]);
@@ -1156,7 +1411,7 @@ export class FlowAdapter {
       .catch(() => 0);
     await this.openAssetMenu(page, media);
     const download = await firstVisible([
-      page.locator('[role="menuitem"]').filter({ has: page.locator("i.google-symbols", { hasText: /^download$/ }) }),
+      page.locator('[role="menuitem"]').filter({ has: page.locator(ICON, { hasText: /^download$/ }) }),
     ]);
     if (download) {
       if (await download.getAttribute("aria-haspopup")) await download.hover({ force: true });

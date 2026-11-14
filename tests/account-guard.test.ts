@@ -33,8 +33,13 @@ test("account connection is refused when a verified default already exists", asy
   assert.match(listText, /"readyForGeneration": true/);
   assert.match(listText, /ACCOUNT IS ALREADY CONNECTED/);
 
-  const begin = await client.callTool({ name: "flow_begin_account_connection", arguments: {} });
-  const beginText = (begin.content[0] as { type: "text"; text: string }).text;
-  assert.match(beginText, /ALREADY_CONNECTED/);
-  assert.doesNotMatch(beginText, /USER_ACTION_REQUIRED/);
+  const connect = await client.callTool({ name: "flow_connect", arguments: {} });
+  const connectBody = JSON.parse((connect.content[0] as { type: "text"; text: string }).text) as {
+    status: string;
+    alreadyConnected: boolean;
+    accountId: string;
+  };
+  assert.equal(connectBody.status, "connected");
+  assert.equal(connectBody.alreadyConnected, true);
+  assert.equal(connectBody.accountId, "personal");
 });

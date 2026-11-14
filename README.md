@@ -71,12 +71,14 @@ If Flow does not offer a requested model, ratio, duration, output count, or upsc
 
 ### Account connection without entering credentials again
 
-The bundled **Flow Login Bridge** extension reuses Google accounts already signed into the user's normal Chromium profile. Connection is deliberately split into two MCP calls so the agent can explain each user action instead of disappearing into a long-running tool:
+The bundled **Flow Login Bridge** extension reuses Google accounts already signed into the user's normal Chromium profile. Connection is one tool, `flow_connect`, and the user does exactly two things:
 
-1. `flow_begin_account_connection` returns immediately and instructs the agent to stop and tell the user what to click.
-2. The user clicks **Connect Flow** in the extension and replies **connected** after it says **Session sent**.
-3. `flow_complete_account_connection` opens Google's existing-account chooser; the user clicks the desired account.
+1. `flow_connect` returns immediately with the steps the agent must tell the user, then the agent calls `flow_connect` again, which waits.
+2. The user clicks **Connect Flow** in the extension. No reply such as "connected" is needed: the server finishes on its own as soon as the session arrives, and the extension popup shows the progress.
+3. Google's existing-account chooser opens; the user clicks the desired account.
 4. The actual Flow workspace is verified, the temporary window closes, and future automation uses an isolated persistent session.
+
+When an account is already connected, `flow_connect` returns `status=connected` instantly and the user is never asked to connect again.
 
 No email entry, password entry, 2FA entry, cookie JSON, Chromium restart, or remote-debugging launch is required for the normal login path.
 
@@ -166,13 +168,11 @@ Ask the agent:
 
 The correct interaction is:
 
-1. The agent calls `flow_begin_account_connection`, shows you its instructions, and stops.
+1. The agent calls `flow_connect` and tells you the steps.
 2. Open **Flow Login Bridge** in the already-running normal browser and click **Connect Flow**.
-3. When the popup says **Session sent**, return to the agent and reply **connected**.
-4. The agent tells you a temporary chooser will open and calls `flow_complete_account_connection`.
-5. Click one of the existing Google accounts shown in the temporary chooser.
+3. Click one of the existing Google accounts shown in the temporary chooser.
 
-That is the complete normal login flow. Completion is detected automatically and the temporary Flow window closes.
+That is the complete normal login flow. You never have to reply "connected": completion is detected automatically, the popup shows the progress, and the temporary Flow window closes. To add another account later, ask the agent to connect `pro-03` (or any ID); to reconnect one that expired, ask it to reconnect that ID.
 
 To connect additional accounts, repeat the process with IDs such as `studio` or `backup`. Each account receives an isolated persistent browser profile. Operations for one account are serialized; separate accounts can progress independently.
 
@@ -256,14 +256,12 @@ Once the account is connected, users can speak normally:
 The expected agent workflow is:
 
 1. `flow_help` when the user asks what the MCP can do
-2. `flow_list_accounts`
-3. `flow_begin_account_connection`, user instructions, and a hard stop when connection is needed
-4. `flow_complete_account_connection` only after the user confirms the extension click
-5. `flow_inspect_account` immediately before generation
-6. `flow_generate_video` or `flow_generate_image` after explicit authorization
-7. `flow_job_status` for long-running work
-8. `flow_upscale_video` when requested
-9. `flow_download_job` for a ready asset that has not yet been downloaded
+2. `flow_connect` (instant when an account is already connected; otherwise the user clicks the extension and picks the account)
+3. `flow_inspect_account` immediately before generation
+4. `flow_generate_video` or `flow_generate_image` after explicit authorization
+5. `flow_job_status` for long-running work
+6. `flow_upscale_video` when requested
+7. `flow_download_job` for a ready asset that has not yet been downloaded
 
 `flow_list_accounts` returns `connectionStatus`, `connectedAccountIds`, `defaultAccountId`, and an explicit next action. After a successful connection, that account automatically becomes the verified default. Generation and inspection calls may omit `accountId` to use it; provide an ID only when the user deliberately selects another connected account.
 
@@ -311,9 +309,7 @@ The MCP never invents `4x`, silently downgrades a request, or substitutes an unr
 | --- | --- | ---: |
 | `flow_help` | Explain capabilities and concrete user request examples | No |
 | `flow_list_accounts` | List locally configured account profiles | No |
-| `flow_login_bridge_status` | Check the localhost login bridge | No |
-| `flow_begin_account_connection` | Return exact extension instructions immediately, then stop | No |
-| `flow_complete_account_connection` | Consume the user-sent session and verify Flow access | No |
+| `flow_connect` | Connect, add, or reconnect an account: instant when already connected, otherwise returns the user steps and then waits for the extension click and account choice | No |
 | `flow_inspect_account` | Return the live normalized capability map | No |
 | `flow_generate_video` | Generate, optionally upscale, and download video | Yes |
 | `flow_generate_image` | Generate/edit and download an image | Potentially |

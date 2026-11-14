@@ -5,10 +5,11 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { FLOW_ACCOUNT_GUIDANCE, FLOW_AGENT_INSTRUCTIONS, FLOW_TOOL_GUARD } from "./agent-contract.js";
 import { BrowserManager } from "./browser-manager.js";
+import { ConnectionManager, type ConnectionState } from "./connection.js";
 import { CookieBridge } from "./cookie-bridge.js";
 import { errorText, FlowError } from "./errors.js";
 import { FlowAdapter } from "./flow-adapter.js";
-import { assertExistingFiles, requireAbsoluteDirectory } from "./paths.js";
+import { assertExistingFiles, requireAbsoluteDirectory, validateAccountId } from "./paths.js";
 import { FlowStore } from "./store.js";
 import type { FlowJob, GenerationRequest, UiCapabilities } from "./types.js";
 
@@ -18,6 +19,14 @@ const browsers = new BrowserManager(store);
 const cookieBridge = new CookieBridge();
 await cookieBridge.start();
 const flow = new FlowAdapter(store, browsers, cookieBridge);
+const connections = new ConnectionManager(flow, cookieBridge);
+// Clicking Connect Flow with no agent waiting still connects the account: it is
+// added under a fresh ID, becomes the default, and stays connected for every agent.
+cookieBridge.onUnsolicitedSession(async () => {
+  if (connections.pending) return false;
+  connections.start({ accountId: await store.availableAccountId("conta") });
+  return true;
+});
 const extensionDirectory = fileURLToPath(new URL("../extension/", import.meta.url));
 
 const server = new McpServer({
@@ -31,6 +40,46 @@ const server = new McpServer({
 function ok(value: string | FlowJob | UiCapabilities | unknown): { content: Array<{ type: "text"; text: string }> } {
   return {
     content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }],
+  };
+}
+
+const CONNECTION_STEPS: Record<string, string[]> = {
+  awaiting_extension: [
+    "Abra o Chromium onde suas contas do Google já estão logadas.",
+    "Clique na extensão Flow Login Bridge e depois em Connect Flow.",
+    "Vai abrir uma janela do Google: clique na conta que você quer usar no Flow.",
+  ],
+  awaiting_account_choice: ["Na janela do Google que abriu, clique na conta que você quer usar no Flow."],
+  verifying: ["Aguarde alguns segundos: estou verificando se essa conta tem acesso ao Flow."],
+};
+
+function describeConnection(state: ConnectionState, justStarted: boolean): unknown {
+  if (state.phase === "connected") {
+    return {
+      status: "connected",
+      accountId: state.accountId,
+      readyForGeneration: true,
+      message: state.result,
+      agentInstruction: "Connected. Continue with the user's request now (flow_inspect_account, then the generation tool). Do not call flow_connect again.",
+    };
+  }
+  if (state.phase === "failed") {
+    return {
+      status: "failed",
+      error: state.error,
+      agentInstruction: "The connection failed. Tell the user this exact error in their language. Call flow_connect again only if the user wants to retry; never use browser or computer-use tools on Flow.",
+    };
+  }
+  return {
+    status: "awaiting_user",
+    phase: state.phase,
+    connectionId: state.id,
+    message: state.message,
+    userMessage: CONNECTION_STEPS[state.phase] ?? [],
+    extensionDirectory,
+    agentInstruction: justStarted
+      ? "Tell the user the userMessage steps NOW in their language, then IMMEDIATELY call flow_connect again (no arguments needed): it waits for the user. Do not ask the user to reply and never ask them to say 'connected'."
+      : "The user has not finished yet. Call flow_connect again to keep waiting. If this repeats several times, ask the user whether they need help with the userMessage steps.",
   };
 }
 
@@ -103,7 +152,7 @@ server.registerTool(
         connectedAccountIds: accounts.accounts.filter((account) => account.connectionStatus === "connected").map((account) => account.id),
         defaultAccountId: accounts.defaultAccountId,
         ready: Boolean(accounts.defaultAccountId),
-        agentInstruction: "Answer the user in their language with relevant examples. For generation, call flow_list_accounts, flow_inspect_account, then the matching flow_generate_* tool; never operate the Flow website with generic browser tools.",
+        agentInstruction: "Answer the user in their language with relevant examples. For generation, call flow_connect, flow_inspect_account, then the matching flow_generate_* tool; never operate the Flow website with generic browser tools.",
       });
     } catch (error) {
       return failed(error);
@@ -115,7 +164,7 @@ server.registerTool(
   "flow_list_accounts",
   {
     title: "List Google Flow Accounts",
-    description: `MANDATORY FIRST STEP for Google Flow work. Returns readyForGeneration and the verified default account. When readyForGeneration=true, use defaultAccountId and DO NOT call either account-connection tool. ${FLOW_TOOL_GUARD}`,
+    description: `Lists the local Flow accounts and which one is the verified default. Read-only. To get connected, call flow_connect instead. ${FLOW_TOOL_GUARD}`,
     inputSchema: {},
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
@@ -130,8 +179,8 @@ server.registerTool(
         readyForGeneration,
         connectionRequired: !readyForGeneration,
         agentInstruction: readyForGeneration
-          ? `ACCOUNT IS ALREADY CONNECTED. Use '${accounts.defaultAccountId}'. Call flow_inspect_account next. DO NOT call flow_begin_account_connection, flow_complete_account_connection, flow_login_bridge_status, PowerShell, or browser/computer-use tools.`
-          : "No verified default account exists. Call flow_begin_account_connection, STOP and tell the user to click Connect Flow in the extension, then wait for their reply before calling flow_complete_account_connection.",
+          ? `ACCOUNT IS ALREADY CONNECTED. Use '${accounts.defaultAccountId}'. Call flow_inspect_account next. DO NOT call flow_connect, PowerShell, or browser/computer-use tools.`
+          : "No verified default account exists. Call flow_connect and follow its instructions.",
       });
     } catch (error) {
       return failed(error);
@@ -140,99 +189,49 @@ server.registerTool(
 );
 
 server.registerTool(
-  "flow_login_bridge_status",
+  "flow_connect",
   {
-    title: "Check Flow Login Bridge",
-    description: "Login diagnostic only. Reports whether the localhost Flow Login Bridge is waiting for the Chromium extension. Do not use this for generation and do not open Flow with browser tools. Normally call flow_list_accounts first.",
-    inputSchema: {},
-    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-  },
-  async () => {
-    try {
-      return ok(cookieBridge.status());
-    } catch (error) {
-      return failed(error);
-    }
-  },
-);
-
-server.registerTool(
-  "flow_begin_account_connection",
-  {
-    title: "Begin Google Flow Account Connection",
-    description: `FIRST CONNECTION STEP. Returns the exact user instructions and extension path immediately; it never blocks waiting for a click. After this response, STOP and tell the user to open Flow Login Bridge in their normal signed-in Chromium, click Connect Flow, and reply when the popup says Session sent. Do not call the completion tool until the user replies. ${FLOW_TOOL_GUARD}`,
+    title: "Connect a Google Flow Account",
+    description: "FIRST STEP for Google Flow work, and the ONLY account-connection tool. Returns status=connected immediately when a verified account already exists (then do not ask the user to connect anything). Otherwise it starts a connection and returns status=awaiting_user with userMessage: tell the user those steps now, then IMMEDIATELY call flow_connect again; that call waits for the user and finishes by itself once they click Connect Flow in the extension and pick the Google account. Never ask the user to reply connected. Pass accountId to add or reconnect a specific local account. " + FLOW_TOOL_GUARD,
     inputSchema: {
-      accountId: accountId.optional().describe("Optional intended local account ID, used only to make the returned instructions specific."),
-      label: z.string().max(100).optional().describe("Optional intended local label, used only in the returned connection plan."),
+      accountId: accountId.optional().describe("Optional local ID to add or reconnect, such as 'pro-02'. Omit to use the verified default account, or to let a safe ID be created for a new one."),
+      label: z.string().max(100).optional().describe("Optional local label. Omit to use the transferred Chromium profile name."),
+      waitSeconds: z.number().int().min(0).max(600).optional().describe("Seconds to wait for the user to finish. Default: 0 when this call starts a new connection (so you can tell the user what to do first), 240 when a connection is already in progress."),
+      force: z.boolean().default(false).describe("Start a new connection even though a verified account already exists, for example to add another account."),
+      manualLogin: z.boolean().default(false).describe("Open a Google sign-in window in the isolated browser and let the user sign in by hand, without the extension. Use it when the user asks to log in manually or when the extension session is rejected by Google."),
     },
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   },
-  async ({ accountId: id, label }) => {
+  async ({ accountId: id, label, waitSeconds, force, manualLogin }) => {
     try {
       const accounts = await store.listAccounts();
       const connectedDefault = accounts.defaultAccountId
         ? accounts.accounts.find((account) => account.id === accounts.defaultAccountId && account.connectionStatus === "connected")
         : undefined;
-      if (connectedDefault && (!id || id === connectedDefault.id)) {
-        return ok({
-          status: "ALREADY_CONNECTED",
-          accountId: connectedDefault.id,
-          readyForGeneration: true,
-          connectionRequired: false,
-          nextTool: "flow_inspect_account",
-          agentInstruction: `Use connected account '${connectedDefault.id}'. DO NOT ask the user to reconnect and DO NOT run browser or process diagnostics.`,
-        });
+      const requestedId = id ? validateAccountId(id) : undefined;
+      const requested = requestedId ? accounts.accounts.find((account) => account.id === requestedId) : undefined;
+      if (!connections.pending && !force && !manualLogin) {
+        const ready = requestedId ? (requested?.connectionStatus === "connected" ? requested : undefined) : connectedDefault;
+        if (ready) {
+          return ok({
+            status: "connected",
+            alreadyConnected: true,
+            accountId: ready.id,
+            readyForGeneration: true,
+            connectedAccountIds: accounts.accounts.filter((account) => account.connectionStatus === "connected").map((account) => account.id),
+            agentInstruction: "Account '" + ready.id + "' is already connected. Do NOT ask the user to connect anything; continue with flow_inspect_account and the generation tool.",
+          });
+        }
       }
-      const connection = cookieBridge.armForSession(300);
-      const { connectionId, ...bridge } = connection;
-      return ok({
-        status: "USER_ACTION_REQUIRED",
-        accountId: id,
-        label,
-        connectionId,
-        bridge,
-        extensionDirectory,
-        userMessage: [
-          "Open your normal Chromium browser—the one where your Google accounts are already signed in.",
-          "Open the Flow Login Bridge extension.",
-          "Click Connect Flow.",
-          "Wait until the popup says: Session sent.",
-          "Return here and say: connected.",
-        ],
-        nextTool: "flow_complete_account_connection",
-        connectedAccountIds: accounts.accounts.filter((account) => account.connectionStatus === "connected").map((account) => account.id),
-        agentInstruction: "STOP NOW. Show userMessage to the user in their language and wait for their reply. Preserve connectionId, but do not call flow_complete_account_connection in this turn.",
+      const startedNow = !connections.pending;
+      const started = connections.start({
+        ...(requestedId ? { accountId: requestedId } : {}),
+        ...(label ? { label } : {}),
+        ...(manualLogin ? { manualLogin: true } : {}),
       });
-    } catch (error) {
-      return failed(error);
-    }
-  },
-);
-
-server.registerTool(
-  "flow_complete_account_connection",
-  {
-    title: "Complete Google Flow Account Connection",
-    description: `SECOND CONNECTION STEP. Call only after the user confirms they clicked Connect Flow and the extension popup says Session sent. Before calling, tell the user that a temporary Google chooser will open and they should click the desired existing account. Requires the begin-step connectionId and explicit user confirmation; if the session was not sent it fails immediately instead of blocking. ${FLOW_TOOL_GUARD}`,
-    inputSchema: {
-      connectionId: z.string().uuid().describe("Required token returned by flow_begin_account_connection. Never invent or reuse it."),
-      userConfirmedSessionSent: z.literal(true).describe("Must be true only after the user explicitly says the extension popup displayed Session sent."),
-      accountId: accountId.optional().describe("Optional local ID. Omit for the simplest setup; a safe ID is created automatically."),
-      label: z.string().max(100).optional().describe("Optional local label. Omit to use the transferred Chromium profile name."),
-      chooseGoogleAccount: z.boolean().default(true).describe("Keep true to show Google's chooser populated with the transferred existing accounts."),
-      waitForAccountSelectionSeconds: z.number().int().min(30).max(900).default(300).describe("Time for the user to click an existing account in the temporary Google chooser and for Flow to load."),
-    },
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-  },
-  async ({ connectionId, accountId: id, label, chooseGoogleAccount, waitForAccountSelectionSeconds }) => {
-    try {
-      cookieBridge.assertSessionReady(connectionId);
-      return ok(await flow.connectAccount(id, label, {
-        browserMode: "extension",
-        chooseGoogleAccount,
-        waitForBridgeSeconds: 1,
-        waitForAccountSelectionSeconds,
-      }));
+      const wait = waitSeconds ?? (startedNow ? 0 : 240);
+      const state = (wait > 0 ? await connections.wait(wait) : undefined) ?? started;
+      return ok(describeConnection(state, startedNow && wait === 0));
     } catch (error) {
       return failed(error);
     }

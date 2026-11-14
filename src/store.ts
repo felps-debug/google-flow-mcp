@@ -148,7 +148,7 @@ export class FlowStore {
           "login_required",
           "No verified connected Flow account is available.",
           [
-            "Call flow_begin_account_connection, wait for the user's extension click, then call flow_complete_account_connection.",
+            "Call flow_connect, tell the user to click Connect Flow in the extension and pick the Google account, then retry.",
             "Do not select an unverified account or substitute generic browser/computer-use automation.",
           ],
         );
@@ -156,7 +156,7 @@ export class FlowStore {
       throw new FlowError(
         "account_not_found",
         requested ? `Flow account '${requested}' is not configured.` : "No Flow account is configured.",
-        ["Call flow_begin_account_connection, wait for the user's extension click, then call flow_complete_account_connection with a new accountId."],
+        ["Call flow_connect with a new accountId, tell the user to click Connect Flow in the extension and pick the Google account, then retry."],
       );
     }
     return account;
@@ -170,7 +170,7 @@ export class FlowStore {
         "flow_access_unavailable",
         `Google account '${account.id}' is signed in, but its saved session does not expose the Flow generation workspace.`,
         [
-          "Use flow_begin_account_connection and flow_complete_account_connection to select a Google account that has Flow access.",
+          "Call flow_connect and ask the user to pick a Google account that has Flow access.",
           "Do not open, scroll, or automate the public Flow website with browser/computer-use tools.",
         ],
       );
@@ -179,7 +179,7 @@ export class FlowStore {
       "login_required",
       `Flow account '${account.id}' is not a verified connected session.`,
       [
-        `Use flow_begin_account_connection and flow_complete_account_connection with accountId '${account.id}' before generation.`,
+        `Call flow_connect with accountId '${account.id}' before generation, tell the user to click Connect Flow in the extension and pick the Google account, then retry.`,
         "Do not substitute browser/computer-use automation for the Google Flow MCP tools.",
       ],
     );

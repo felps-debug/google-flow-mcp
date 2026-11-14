@@ -7,6 +7,13 @@ const DEFAULT_PORTS = Array.from({ length: 10 }, (_, index) => 37_421 + index);
 const MAX_BODY_BYTES = 5 * 1024 * 1024;
 const SESSION_TTL_MS = 2 * 60 * 1000;
 
+export interface BridgeProgress {
+  phase: string;
+  message: string;
+  accountId?: string;
+  updatedAt: string;
+}
+
 interface Waiter {
   resolve: (session: TransferredBrowserSession) => void;
   reject: (error: FlowError) => void;
@@ -60,8 +67,19 @@ export class CookieBridge {
   private armedUntil = 0;
   private armedAt = 0;
   private connectionId: string | undefined;
+  private progress: BridgeProgress | undefined;
+
+  private unsolicitedHandler: (() => Promise<boolean>) | undefined;
 
   constructor(private readonly candidatePorts: number[] = DEFAULT_PORTS) {}
+
+  /**
+   * Called when a session arrives while nobody is waiting for one. Return true once
+   * a connection was started to consume it, false to reject the session.
+   */
+  onUnsolicitedSession(handler: () => Promise<boolean>): void {
+    this.unsolicitedHandler = handler;
+  }
 
   async start(): Promise<number> {
     if (this.server && this.port) return this.port;
@@ -86,14 +104,34 @@ export class CookieBridge {
     throw new FlowError("browser_error", `Flow login bridge could not bind localhost ports ${this.candidatePorts.join(", ")}.`);
   }
 
-  status(): { running: boolean; port?: number; waitingForBrowser: boolean; queuedSession: boolean; connectionRequestedAt?: string } {
+  status(): {
+    running: boolean;
+    port?: number;
+    waitingForBrowser: boolean;
+    queuedSession: boolean;
+    autoConnect: boolean;
+    connectionRequestedAt?: string;
+    progress?: BridgeProgress;
+  } {
     const armed = this.armedUntil > Date.now();
     return {
       running: Boolean(this.server),
+      autoConnect: Boolean(this.unsolicitedHandler),
       ...(this.port ? { port: this.port } : {}),
       waitingForBrowser: this.waiters.length > 0 || armed,
       queuedSession: Boolean(this.queued && Date.now() - Date.parse(this.queued.receivedAt) <= SESSION_TTL_MS),
       ...(armed && this.armedAt ? { connectionRequestedAt: new Date(this.armedAt).toISOString() } : {}),
+      ...(this.progress ? { progress: this.progress } : {}),
+    };
+  }
+
+  /** Lets the extension popup show what the connection is doing right now. */
+  setProgress(progress: { phase: string; message: string; accountId?: string }): void {
+    this.progress = {
+      phase: progress.phase.slice(0, 40),
+      message: progress.message.slice(0, 300),
+      ...(progress.accountId ? { accountId: progress.accountId.slice(0, 48) } : {}),
+      updatedAt: new Date().toISOString(),
     };
   }
 
@@ -109,14 +147,14 @@ export class CookieBridge {
       throw new FlowError(
         "validation_error",
         "The account connection token is missing, expired, or belongs to another MCP process.",
-        ["Restart with flow_begin_account_connection and use the connectionId it returns."],
+        ["Call flow_connect to start a new connection."],
       );
     }
     if (!this.queued || Date.now() - Date.parse(this.queued.receivedAt) > SESSION_TTL_MS) {
       throw new FlowError(
         "login_required",
         "Flow Login Bridge has not sent the browser session for this connection yet.",
-        ["Stop and tell the user to open Flow Login Bridge, click Connect Flow, wait for Session sent, and reply connected."],
+        ["Tell the user to open Flow Login Bridge and click Connect Flow, then call flow_connect again to keep waiting."],
       );
     }
   }
@@ -198,6 +236,7 @@ export class CookieBridge {
         ...(typeof parsed.profile === "string" ? { profile: parsed.profile.slice(0, 100) } : {}),
         receivedAt: new Date().toISOString(),
       };
+      const solicited = this.armedUntil > Date.now() || this.waiters.length > 0;
       const waiter = this.waiters.shift();
       this.armedUntil = 0;
       this.armedAt = 0;
@@ -207,6 +246,16 @@ export class CookieBridge {
         waiter.resolve(session);
       } else {
         this.queued = session;
+      }
+      // The user clicked the extension on their own, with no agent waiting: let the
+      // server finish the connection by itself so the account simply stays connected.
+      if (!solicited && this.unsolicitedHandler) {
+        const accepted = await this.unsolicitedHandler();
+        if (!accepted) {
+          this.queued = undefined;
+          this.json(response, 409, { error: "A conexão de outra conta já está em andamento. Termine essa primeiro." });
+          return;
+        }
       }
       this.json(response, 200, { ok: true, cookieCount: session.cookies.length, waitingRequestClaimed: Boolean(waiter) });
     } catch (error) {

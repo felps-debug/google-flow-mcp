@@ -82,15 +82,12 @@ Tell the agent:
 
 > Connect my Google Flow account.
 
-The correct interaction is deliberately split so the agent cannot hide the user action inside a long-running tool call:
+The correct interaction has two user actions and no confirmation message:
 
-1. The agent calls `flow_begin_account_connection`.
-2. The agent tells you to open **Flow Login Bridge** in normal Chromium and click **Connect Flow**.
-3. The extension displays **Session sent**. Return to the agent and reply **connected**.
-4. The agent tells you that a temporary Google chooser will open, then calls `flow_complete_account_connection`.
-5. Click the desired account already shown in Google's chooser.
-6. Flow workspace access is verified automatically and the temporary window closes.
-7. `flow_list_accounts` must report that account as `connected` and as `defaultAccountId`.
+1. The agent calls `flow_connect` and tells you to open **Flow Login Bridge** in normal Chromium and click **Connect Flow**.
+2. Click the desired account already shown in Google's temporary chooser.
+3. Flow workspace access is verified automatically and the temporary window closes. You never need to reply "connected": the agent's waiting `flow_connect` call finishes by itself and the extension popup shows the progress.
+4. `flow_list_accounts` must report that account as `connected` and as `defaultAccountId`.
 
 If the public Flow marketing page appears instead of the workspace, the MCP returns `flow_access_unavailable`; the agent must not scroll or automate that page.
 

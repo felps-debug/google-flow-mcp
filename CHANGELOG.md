@@ -2,6 +2,19 @@
 
 All notable changes to Google Flow MCP are documented here.
 
+## [Unreleased]
+
+### Changed
+
+- Account connection is now a single idempotent tool, `flow_connect`, replacing `flow_begin_account_connection`, `flow_complete_account_connection`, and `flow_login_bridge_status`. It returns instantly when an account is already connected; otherwise the agent tells the user the steps and calls it again to wait. The server finishes by itself when the extension sends the session, so the user no longer replies "connected"
+- The Flow Login Bridge popup (v0.2.0, now in Portuguese) shows live progress: waiting for the click, choosing the account, verifying, connected, or the failure reason
+- The bridge `/status` endpoint reports connection progress
+
+### Added
+
+- `scripts/launch.mjs`: a self-healing launcher that installs missing dependencies and rebuilds a stale `dist/` before starting, and explains failures on stderr instead of an opaque "Connection closed"
+- `npm run doctor` and `npm run setup`: check the environment, accounts, and the Claude Code and Codex registrations, and repair them (Codex config is backed up first and other servers are untouched)
+
 ## [0.2.3] - 2026-07-19
 
 ### Fixed

@@ -21,7 +21,9 @@
     "SECURITY.md",
     "CONTRIBUTING.md",
     "CHANGELOG.md",
-    "LICENSE"
+    "LICENSE",
+    "scripts/launch.mjs",
+    "scripts/doctor.mjs"
   ],
   "engines": {
     "node": ">=20"
@@ -36,7 +38,9 @@
     "dev": "tsx src/index.ts",
     "account": "tsx src/cli.ts account",
     "install-extension": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-extension.ps1",
-    "setup:antigravity": "node scripts/setup-antigravity.mjs"
+    "setup:antigravity": "node scripts/setup-antigravity.mjs",
+    "doctor": "node scripts/doctor.mjs",
+    "setup": "node scripts/doctor.mjs --fix"
   },
   "keywords": [
     "mcp",
